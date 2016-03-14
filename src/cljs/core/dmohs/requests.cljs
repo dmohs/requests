@@ -137,6 +137,13 @@
         ctx)))
 
 
+(defn collect-body [ctx f]
+  (let [req (:req ctx)
+        data (atom "")]
+    (.on req "data" (fn [chunk] (swap! data str chunk)))
+    (.on req "end" (fn [] (f (assoc-in ctx [:request :body] @data))))))
+
+
 (defn process-pipeline [ctx next-fn & rest-fns]
   (if rest-fns
     (next-fn ctx #(apply process-pipeline % rest-fns))
