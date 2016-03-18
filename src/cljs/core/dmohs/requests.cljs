@@ -22,12 +22,14 @@
 
 
 (defn find-header [k headers]
-  (let [lower-case-key (clojure.string/lower-case k)]
-    (some
-     (fn [[k v]]
-       (when (= (clojure.string/lower-case k) lower-case-key)
-         [k v]))
-     headers)))
+  (if-let [v (get headers k)]
+    [k v]
+    (let [lower-case-key (clojure.string/lower-case (name k))]
+      (some
+       (fn [[k v]]
+         (when (= (clojure.string/lower-case (name k)) lower-case-key)
+           [k v]))
+       headers))))
 
 
 (defn get-header-value [k headers]
@@ -39,10 +41,11 @@
         response (:response ctx)
         response-headers (:headers response)
         body (:body response)
-        json? (= "application/json" (get-header-value "content-type" response-headers))
+        json? (= "application/json" (get-header-value :content-type response-headers))
         body (if json? (str (.stringify js/JSON (clj->js body) nil 2) "\n") body)
-        status-code (or (:status-code response) (if (nil? body) 204 200))]
-    (.writeHead res status-code (clj->js (:headers response)))
+        status-code (or (:status-code response) (if (nil? body) 204 200))
+        response-headers (merge (if body {:content-length (count body)} nil) response-headers)]
+    (.writeHead res status-code (clj->js response-headers))
     (if body (.end res body) (.end res))
     (when-let [f @request-logger]
       (f (-> ctx
@@ -86,7 +89,11 @@
    :req req
    :request {:url (.-url req)
              :method (keyword (clojure.string/lower-case (.-method req)))
-             :headers (js->clj (.-headers req))
+             :headers (reduce-kv
+                       (fn [r k v]
+                         (assoc r (keyword (clojure.string/lower-case k)) v))
+                       {}
+                       (js->clj (.-headers req)))
              :client-ip (last (clojure.string/split (.. req -connection -remoteAddress) #":"))}
    :res res
    :response {}})
@@ -102,12 +109,30 @@
 
 (defn json-body [ctx x]
   (-> ctx
-      (update-in [:response :headers] assoc "Content-Type" "application/json")
+      (update-in [:response :headers] assoc :content-type "application/json")
       (assoc-in [:response :body] x)))
+
+
+(defn add-cors-headers
+  ([ctx]
+   (add-cors-headers
+    ctx
+    #{:accept :accept-version :api-version :authorization :content-range :content-type
+      :origin :range :x-requested-with}))
+  ([ctx allowed-headers]
+   (update-in ctx [:response :headers] merge
+              {:access-control-allow-origin "*" :access-control-allow-credentials "true"
+               :access-control-allow-headers
+               (clojure.string/join "," (map name allowed-headers))
+               :access-control-expose-headers
+               (clojure.string/join "," (map name allowed-headers))
+               :access-control-max-age 1728000})))
 
 
 (defn respond-with-not-found [ctx]
   (respond (-> ctx (status-code 404) (json-body {:error :not-found :message "URL not found"}))))
+
+
 (defn respond-with-method-not-allowed [ctx allowed-methods]
   (respond
    (-> ctx
@@ -123,18 +148,28 @@
                    (map (comp clojure.string/upper-case name) allowed-methods))))))
 
 
-  (defn handle-url [ctx url-regex method-set handler-fn & args]
-    (let [request (:request ctx)]
-      (if-let [matches (re-matches url-regex (:url request))]
-        (if (contains? method-set (:method request))
-          (let [params (rest matches)
-                ctx (if-not (empty? params) (assoc-in ctx [:request :url-params] params) ctx)]
-            (apply handler-fn ctx args)
-            nil)
+(defn- maybe-handle-url [fail? ctx url-regex method-set handler-fn & args]
+  (let [request (:request ctx)]
+    (if-let [matches (re-matches url-regex (:url request))]
+      (if (contains? method-set (:method request))
+        (let [params (when-not (string? matches) (rest matches))
+              ctx (if-not (empty? params) (assoc-in ctx [:request :url-params] params) ctx)]
+          (apply handler-fn ctx args)
+          nil)
+        (if fail?
           (do
             (respond-with-method-not-allowed ctx method-set)
-            nil))
-        ctx)))
+            nil)
+          ctx))
+      ctx)))
+
+
+(defn handle-url [ctx url-regex method-set handler-fn & args]
+  (apply maybe-handle-url true ctx url-regex method-set handler-fn args))
+
+
+(defn handle-or-pass-url [ctx url-regex method-set handler-fn & args]
+  (apply maybe-handle-url false ctx url-regex method-set handler-fn args))
 
 
 (defn collect-body [ctx f]
