@@ -5,6 +5,9 @@
    ))
 
 (def buffer (nodejs/require "buffer"))
+(def http (nodejs/require "http"))
+(def https (nodejs/require "https"))
+(def url (nodejs/require "url"))
 
 
 (defn time-call [k f & args]
@@ -36,21 +39,67 @@
   (second (find-header k headers)))
 
 
+(defn inbound? [ctx] (= :inbound (:type ctx)))
+
+
+(defn- get-content [ctx]
+  (let [k (if (inbound? ctx) :response :request)
+        headers (get-in ctx [k :headers])
+        body (get-in ctx [k :body])
+        json? (= "application/json" (get-header-value :content-type headers))
+        body (if (and json? body) (str (.stringify js/JSON (clj->js body) nil 2) "\n") body)
+        headers (merge (if body {:content-length (count body)} nil) headers)]
+    [headers body]))
+
+
 (defn respond [ctx]
+  (assert (= :inbound (:type ctx)))
   (let [res (:res ctx)
-        response (:response ctx)
-        response-headers (:headers response)
-        body (:body response)
-        json? (= "application/json" (get-header-value :content-type response-headers))
-        body (if json? (str (.stringify js/JSON (clj->js body) nil 2) "\n") body)
-        status-code (or (:status-code response) (if (nil? body) 204 200))
-        response-headers (merge (if body {:content-length (count body)} nil) response-headers)]
-    (.writeHead res status-code (clj->js response-headers))
+        [headers body] (get-content ctx)
+        ctx (assoc-in ctx [:response :status-code]
+                      (or (-> ctx :response :status-code) (if (nil? body) 204 200)))]
+    (.writeHead res (-> ctx :response :status-code) (clj->js headers))
     (if body (.end res body) (.end res))
     (when-let [f @request-logger]
-      (f (-> ctx
-             (dissoc :req :res)
-             (assoc-in [:response :status-code] status-code))))))
+      (f (-> ctx (dissoc :req :res))))))
+
+
+(defn- add-response [ctx res]
+  (assoc ctx
+         :res res
+         :response {:headers (js->clj (.-headers res))
+                    :http-version (.-httpVersion res)
+                    :status-code (.-statusCode res)
+                    :status-message (.-statusMessage res)}))
+
+
+(defn send [ctx cb]
+  (assert (= :outbound (:type ctx)))
+  (let [[headers body] (get-content ctx)
+        request (:request ctx)
+        request (if (contains? request :url)
+                  (let [parsed-url (.parse url (:url request))]
+                    (merge {:hostname (.-hostname parsed-url)
+                            :path (str (.-path parsed-url) (.-hash parsed-url))
+                            :protocol (.-protocol parsed-url)}
+                           (when-let [x (.-port parsed-url)] {:port x})
+                           (dissoc request :url)))
+                  request)
+        library (if (or (= "https:" (:protocol request)) (= :https (:protocol request)))
+                  https
+                  http)
+        r (.request library
+                    (-> request (assoc :headers headers) (dissoc :body :protocol) clj->js)
+                    (fn [res]
+                      (let [ctx (add-response ctx res)]
+                        (when-let [f @request-logger]
+                          (f ctx)))
+                      (cb nil ctx)))]
+    (.on r "error" (fn [err] (cb err nil)))
+    (when body
+      (.write r body))
+    (.end r)
+    ctx))
 
 
 (defn- remove-base64-padding [x]
@@ -84,19 +133,25 @@
    "cleanb64uuidnotfound00"))
 
 
-(defn create-context [req res]
-  {:id (find-clean-base64-uuid)
-   :req req
-   :request {:url (.-url req)
-             :method (keyword (clojure.string/lower-case (.-method req)))
-             :headers (reduce-kv
-                       (fn [r k v]
-                         (assoc r (keyword (clojure.string/lower-case k)) v))
-                       {}
-                       (js->clj (.-headers req)))
-             :client-ip (last (clojure.string/split (.. req -connection -remoteAddress) #":"))}
-   :res res
-   :response {}})
+(defn create-context
+  ([req res]
+   {:id (find-clean-base64-uuid)
+    :type :inbound
+    :req req
+    :request {:url (.-url req)
+              :method (keyword (clojure.string/lower-case (.-method req)))
+              :headers (reduce-kv
+                        (fn [r k v]
+                          (assoc r (keyword (clojure.string/lower-case k)) v))
+                        {}
+                        (js->clj (.-headers req)))
+              :client-ip (last (clojure.string/split (.. req -connection -remoteAddress) #":"))}
+    :res res
+    :response {}})
+  ([m]
+   {:id (find-clean-base64-uuid)
+    :type :outbound
+    :request m}))
 
 
 (defn status-code [ctx code]
@@ -108,9 +163,10 @@
 
 
 (defn json-body [ctx x]
-  (-> ctx
-      (update-in [:response :headers] assoc :content-type "application/json")
-      (assoc-in [:response :body] x)))
+  (let [location (if (inbound? ctx) :response :request)]
+    (-> (if (inbound? ctx) ctx (assoc-in ctx [:request :method] :post))
+        (update-in [location :headers] assoc :content-type "application/json")
+        (assoc-in [location :body] x))))
 
 
 (defn add-cors-headers
@@ -129,8 +185,10 @@
                :access-control-max-age 1728000})))
 
 
-(defn respond-with-not-found [ctx]
-  (respond (-> ctx (status-code 404) (json-body {:error :not-found :message "URL not found"}))))
+(defn respond-with-not-found
+  ([ctx] (respond-with-not-found ctx {:error :not-found :message "URL not found"}))
+  ([ctx error]
+   (respond (-> ctx (status-code 404) (json-body error)))))
 
 
 (defn respond-with-method-not-allowed [ctx allowed-methods]
@@ -146,6 +204,14 @@
                   (clojure.string/join
                    ","
                    (map (comp clojure.string/upper-case name) allowed-methods))))))
+
+
+(defn respond-with-bad-request [ctx error message]
+  (-> ctx (status-code 400) (json-body {:error error :message message}) respond))
+
+
+(defn send-server-error [ctx]
+  (-> ctx (status-code 500) respond))
 
 
 (defn- maybe-handle-url [fail? ctx url-regex method-set handler-fn & args]
@@ -177,6 +243,26 @@
         data (atom "")]
     (.on req "data" (fn [chunk] (swap! data str chunk)))
     (.on req "end" (fn [] (f (assoc-in ctx [:request :body] @data))))))
+
+
+(defn json->clj [x]
+  (try
+    (js->clj (js/JSON.parse x))
+    (catch js/Object e
+      :json-parse-error)))
+
+
+(defn collect-json-body [ctx f]
+  (collect-body
+   ctx
+   (fn [ctx]
+     (let [parsed (json->clj (:body (:request ctx)))]
+       (if (= parsed :json-parse-error)
+         (-> ctx
+             (status-code 400)
+             (json-body {:error :parse-failure :message "Failed to parse JSON from request"})
+             respond)
+         (f (assoc-in ctx [:request :body] parsed)))))))
 
 
 (defn process-pipeline [ctx next-fn & rest-fns]
