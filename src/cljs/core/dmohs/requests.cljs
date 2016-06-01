@@ -93,8 +93,8 @@
                     (fn [res]
                       (let [ctx (add-response ctx res)]
                         (when-let [f @request-logger]
-                          (f ctx)))
-                      (cb nil ctx)))]
+                          (f ctx))
+                        (cb nil ctx))))]
     (.on r "error" (fn [err] (cb err nil)))
     (when body
       (.write r body))
@@ -239,10 +239,10 @@
 
 
 (defn collect-body [ctx f]
-  (let [req (:req ctx)
+  (let [x (if (inbound? ctx) (:req ctx) (:res ctx))
         data (atom "")]
-    (.on req "data" (fn [chunk] (swap! data str chunk)))
-    (.on req "end" (fn [] (f (assoc-in ctx [:request :body] @data))))))
+    (.on x "data" (fn [chunk] (swap! data str chunk)))
+    (.on x "end" (fn [] (f (assoc-in ctx [(if (inbound? ctx) :request :response) :body] @data))))))
 
 
 (defn json->clj [x]
