@@ -48,7 +48,7 @@
         body (get-in ctx [k :body])
         json? (= "application/json" (get-header-value :content-type headers))
         body (if (and json? body) (str (.stringify js/JSON (clj->js body) nil 2) "\n") body)
-        headers (merge (if body {:content-length (count body)} nil) headers)]
+        headers (merge (if body {:content-length (.byteLength js/Buffer body "utf8")} nil) headers)]
     [headers body]))
 
 
