@@ -138,7 +138,10 @@
    {:id (find-clean-base64-uuid)
     :type :inbound
     :req req
-    :request {:url (.-url req)
+    :request {:url (let [parsed (.parse url (.-url req) true)
+                         sanitized (.parse js/JSON (.stringify js/JSON parsed))
+                         converted (js->clj sanitized :keywordize-keys true)]
+                     converted)
               :method (keyword (clojure.string/lower-case (.-method req)))
               :headers (reduce-kv
                         (fn [r k v]
@@ -216,7 +219,7 @@
 
 (defn- maybe-handle-url [fail? ctx url-regex method-set handler-fn & args]
   (let [request (:request ctx)]
-    (if-let [matches (re-matches url-regex (:url request))]
+    (if-let [matches (re-matches url-regex (get-in request [:url :pathname]))]
       (if (contains? method-set (:method request))
         (let [params (when-not (string? matches) (rest matches))
               ctx (if-not (empty? params) (assoc-in ctx [:request :url-params] params) ctx)]
